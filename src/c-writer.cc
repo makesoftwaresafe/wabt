@@ -308,6 +308,7 @@ class CWriter {
 
   void Indent(int size = INDENT_SIZE);
   void Dedent(int size = INDENT_SIZE);
+  void NonIndented(std::function<void()> func);
   void WriteIndent();
   void WriteData(const char* src, size_t size);
   void Writef(const char* format, ...);
@@ -402,6 +403,9 @@ class CWriter {
   void WriteElemInitializerDecls();
   void WriteElemInitializers();
   void WriteElemTableInit(bool, const ElemSegment*, const Table*);
+  bool IsSingleUnsharedMemory();
+  void InstallSegueBase(Memory* memory, bool save_old_value);
+  void RestoreSegueBase();
   void WriteExports(CWriterPhase);
   void WriteTailCallExports(CWriterPhase);
   void WriteInitDecl();
@@ -1021,6 +1025,13 @@ void CWriter::Dedent(int size) {
   assert(indent_ >= 0);
 }
 
+void CWriter::NonIndented(std::function<void()> func) {
+  int copy = indent_;
+  indent_ = 0;
+  func();
+  indent_ = copy;
+}
+
 void CWriter::WriteIndent() {
   static char s_indent[] =
       "                                                                       "
@@ -1292,7 +1303,15 @@ void CWriter::Write(const Const& const_) {
         // Negative zero. Special-cased so it isn't written as -0 below.
         Writef("-0.0");
       } else {
-        Writef("%.17g", Bitcast<double>(f64_bits));
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%.17g", Bitcast<double>(f64_bits));
+        // Append .0 if sprint didn't include a decimal point or use the
+        // exponent ('e') form.  This is a workaround for an MSVC parsing
+        // issue: https://github.com/WebAssembly/wabt/issues/2422
+        if (!strchr(buf, '.') && !strchr(buf, 'e')) {
+          strcat(buf, ".0");
+        }
+        Writef("%s", buf);
       }
       break;
     }
@@ -1471,6 +1490,11 @@ std::string CWriter::GenerateHeaderGuard() const {
 void CWriter::WriteSourceTop() {
   Write(s_source_includes);
   Write(Newline(), "#include \"", header_name_, "\"", Newline());
+
+  if (IsSingleUnsharedMemory()) {
+    Write("#define IS_SINGLE_UNSHARED_MEMORY 1", Newline());
+  }
+
   Write(s_source_declarations, Newline());
 
   if (module_->features_used.simd) {
@@ -1858,7 +1882,7 @@ void CWriter::WriteTailCallWeakImports() {
     Index num_results = func.GetNumResults();
     if (num_params >= 1) {
       Write(func.decl.sig.param_types, " params;", Newline());
-      Write("wasm_rt_memcpy(params, tail_call_stack, sizeof(params);",
+      Write("wasm_rt_memcpy(params, tail_call_stack, sizeof(params));",
             Newline());
     }
 
@@ -2417,6 +2441,28 @@ void CWriter::WriteElemTableInit(bool active_initialization,
   Write(");", Newline());
 }
 
+bool CWriter::IsSingleUnsharedMemory() {
+  return module_->memories.size() == 1 &&
+         !module_->memories[0]->page_limits.is_shared;
+}
+
+void CWriter::InstallSegueBase(Memory* memory, bool save_old_value) {
+  NonIndented([&] { Write("#if WASM_RT_USE_SEGUE", Newline()); });
+  if (save_old_value) {
+    Write("uintptr_t segue_saved_base = WASM_RT_SEGUE_READ_BASE();", Newline());
+  }
+  auto primary_memory =
+      ExternalInstanceRef(ModuleFieldType::Memory, memory->name);
+  Write("WASM_RT_SEGUE_WRITE_BASE(", primary_memory, ".data);", Newline());
+  NonIndented([&] { Write("#endif", Newline()); });
+}
+
+void CWriter::RestoreSegueBase() {
+  NonIndented([&] { Write("#if WASM_RT_USE_SEGUE", Newline()); });
+  Write("WASM_RT_SEGUE_WRITE_BASE(segue_saved_base);", Newline());
+  NonIndented([&] { Write("#endif", Newline()); });
+}
+
 void CWriter::WriteExports(CWriterPhase kind) {
   if (module_->exports.empty())
     return;
@@ -2492,8 +2538,14 @@ void CWriter::WriteExports(CWriterPhase kind) {
     switch (export_->kind) {
       case ExternalKind::Func: {
         Write(OpenBrace());
-        if (func_->GetNumResults() > 0) {
-          Write("return ");
+        if (IsSingleUnsharedMemory()) {
+          InstallSegueBase(module_->memories[0], true /* save_old_value */);
+        }
+        auto num_results = func_->GetNumResults();
+        if (num_results > 1) {
+          Write(func_->decl.sig.result_types, " ret = ");
+        } else if (num_results == 1) {
+          Write(func_->GetResultType(0), " ret = ");
         }
         Write(ExternalRef(ModuleFieldType::Func, internal_name), "(");
 
@@ -2505,6 +2557,12 @@ void CWriter::WriteExports(CWriterPhase kind) {
           Write("instance");
         }
         WriteParamSymbols(index_to_name);
+        if (IsSingleUnsharedMemory()) {
+          RestoreSegueBase();
+        }
+        if (num_results > 0) {
+          Write("return ret;", Newline());
+        }
         Write(CloseBrace(), Newline());
 
         local_sym_map_.clear();
@@ -2603,6 +2661,9 @@ void CWriter::WriteInit() {
   }
   if (!module_->memories.empty()) {
     Write("init_memories(instance);", Newline());
+    if (IsSingleUnsharedMemory()) {
+      InstallSegueBase(module_->memories[0], true /* save_old_value */);
+    }
   }
   if (!module_->tables.empty() && !module_->elem_segments.empty()) {
     Write("init_elem_instances(instance);", Newline());
@@ -2622,6 +2683,10 @@ void CWriter::WriteInit() {
       Write("(instance);");
     }
     Write(Newline());
+  }
+
+  if (IsSingleUnsharedMemory()) {
+    RestoreSegueBase();
   }
   Write(CloseBrace(), Newline());
 }
@@ -3636,18 +3701,18 @@ void CWriter::Write(const ExprList& exprs) {
 
       case ExprType::TableGrow: {
         const Table* table = module_->GetTable(cast<TableGrowExpr>(&expr)->var);
-        Write(StackVar(1, Type::I32), " = wasm_rt_grow_",
+        Write(StackVar(1, table->elem_limits.IndexType()), " = wasm_rt_grow_",
               GetReferenceTypeName(table->elem_type), "_table(",
               ExternalInstancePtr(ModuleFieldType::Table, table->name), ", ",
               StackVar(0), ", ", StackVar(1), ");", Newline());
         DropTypes(2);
-        PushType(Type::I32);
+        PushType(table->elem_limits.IndexType());
       } break;
 
       case ExprType::TableSize: {
         const Table* table = module_->GetTable(cast<TableSizeExpr>(&expr)->var);
 
-        PushType(Type::I32);
+        PushType(table->elem_limits.IndexType());
         Write(StackVar(0), " = ",
               ExternalInstanceRef(ModuleFieldType::Table, table->name),
               ".size;", Newline());
@@ -3725,6 +3790,9 @@ void CWriter::Write(const ExprList& exprs) {
         Write(StackVar(0), " = ", func, "(",
               ExternalInstancePtr(ModuleFieldType::Memory, memory->name), ", ",
               StackVar(0), ");", Newline());
+        if (IsSingleUnsharedMemory()) {
+          InstallSegueBase(module_->memories[0], false /* save_old_value */);
+        }
         break;
       }
 

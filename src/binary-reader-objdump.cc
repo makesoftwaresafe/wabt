@@ -1550,6 +1550,9 @@ Result BinaryReaderObjdump::OnImportTable(Index import_index,
   if (elem_limits->has_max) {
     PrintDetails(" max=%" PRId64, elem_limits->max);
   }
+  if (elem_limits->is_64) {
+    PrintDetails(" i64");
+  }
   PrintDetails(" <- " PRIstringview "." PRIstringview "\n",
                WABT_PRINTF_STRING_VIEW_ARG(module_name),
                WABT_PRINTF_STRING_VIEW_ARG(field_name));
@@ -1643,6 +1646,9 @@ Result BinaryReaderObjdump::OnTable(Index index,
   auto name = GetTableName(index);
   if (!name.empty()) {
     PrintDetails(" <" PRIstringview ">", WABT_PRINTF_STRING_VIEW_ARG(name));
+  }
+  if (elem_limits->is_64) {
+    PrintDetails(" i64");
   }
   PrintDetails("\n");
   return Result::Ok;
